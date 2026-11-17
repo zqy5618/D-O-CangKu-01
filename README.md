@@ -39,6 +39,21 @@ recipient; it was only open concurrently.
 | 2026-11-17 | [#92 comment](https://github.com/jazzenchen/agent-hud-open/issues/92#issuecomment-6943378215) | `issue92-comment-20261117.md` |
 | 2026-11-17 | [#93 comment](https://github.com/jazzenchen/agent-hud-open/issues/93#issuecomment-6943378970) | `issue93-comment-20261117.md` |
 
+## Patches
+
+`patches/` holds the local patches, written against `b4fcb0e` and **not
+rebased** — reference implementations, not a PR. Mirror gist:
+https://gist.github.com/zqy5618/a1660f500435f9233bc7441518b88af9
+
+- `05-refuse-conflicting-targets.patch` — refuse when `to` and `reply_to` name
+  different sessions; inbound header gains `· sender <sessionId>`.
+- `06-sent-outbox-tool.patch` — `list_sent_messages` read view over the journal
+  (issue #92).
+- `04-first-visible-quota-row.patch` — HUD quota row from the first visible row
+  (issue #91).
+- `02-message-only-session-reads.patch` — message page without loading token,
+  billing or tool-call history.
+
 ## Other files
 
 - `repro-record.md` — the evidence table (ids, clients, times, states).

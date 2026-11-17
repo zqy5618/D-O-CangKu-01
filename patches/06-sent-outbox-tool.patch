@@ -1,0 +1,209 @@
+diff --git a/src/crates/messaging/src/journal.rs b/src/crates/messaging/src/journal.rs
+index 66e6207..dd646d8 100644
+--- a/src/crates/messaging/src/journal.rs
++++ b/src/crates/messaging/src/journal.rs
+@@ -108,6 +108,10 @@ impl Journal {
+     pub fn find(&self, id: &str) -> Option<&Message> {
+         self.messages.iter().find(|message| message.id == id)
+     }
++    /// Every message kept, oldest first.
++    pub fn messages(&self) -> impl DoubleEndedIterator<Item = &Message> {
++        self.messages.iter()
++    }
+     /// What `session` was sent and did not refuse, newest first.
+     pub fn received<'a>(
+         &'a self,
+diff --git a/src/crates/messaging/src/lib.rs b/src/crates/messaging/src/lib.rs
+index bd469c1..1f43c30 100644
+--- a/src/crates/messaging/src/lib.rs
++++ b/src/crates/messaging/src/lib.rs
+@@ -18,6 +18,7 @@ mod listing;
+ mod outcome;
+ mod preferences;
+ mod send;
++mod sent;
+ mod snapshot;
+ mod start;
+ #[cfg(test)]
+@@ -159,6 +160,7 @@ impl Messaging {
+         let arguments = &params["arguments"];
+         match params["name"].as_str().unwrap_or("") {
+             "list_sessions" => Ok(self.list(caller.as_ref(), host)),
++            "list_sent_messages" => Ok(self.sent(caller.as_ref(), arguments, host)),
+             "send_message" => {
+                 let Some(caller) = caller else {
+                     return Ok(refused(&words::no_caller(language(host.snapshot))));
+diff --git a/src/crates/messaging/src/sent.rs b/src/crates/messaging/src/sent.rs
+new file mode 100644
+index 0000000..2017cf1
+--- /dev/null
++++ b/src/crates/messaging/src/sent.rs
+@@ -0,0 +1,56 @@
++//! `list_sent_messages`: what this session sent, for the call whose own answer
++//! was lost (the relay timed out) and that must know whether the words went and
++//! where. Newest first; only the caller's own messages.
++use super::*;
++
++/// How many rows a call gets when it names no limit, and the most it may ask
++/// for.
++const DEFAULT_LIMIT: u64 = 20;
++const MAX_LIMIT: u64 = 100;
++
++impl Messaging {
++    pub(crate) fn sent(&self, caller: Option<&Caller>, arguments: &Value, host: &Host<'_>) -> Value {
++        let Some(caller) = caller else {
++            return refused(&words::no_caller(language(host.snapshot)));
++        };
++        let limit = arguments["limit"]
++            .as_u64()
++            .unwrap_or(DEFAULT_LIMIT)
++            .clamp(1, MAX_LIMIT) as usize;
++        let since = arguments["since"].as_i64();
++        // Newest first by the time each was sent; equal times keep the
++        // newest record first, as the journal writes them in order.
++        let mut messages = self
++            .journal
++            .messages()
++            .rev()
++            .filter(|message| {
++                message.from.client == caller.client
++                    && same_session(&message.from.session_id, &caller.session_id)
++            })
++            .filter(|message| since.is_none_or(|since| message.sent_at_ms >= since))
++            .collect::<Vec<_>>();
++        messages.sort_by(|a, b| b.sent_at_ms.cmp(&a.sent_at_ms));
++        messages.truncate(limit);
++        let rows = messages
++            .into_iter()
++            .map(|message| {
++                json!({
++                    "id": message.id.as_str(),
++                    "kind": message.kind,
++                    "to": {
++                        "client": message.to.client.as_str(),
++                        "sessionId": message.to.session_id.as_str(),
++                        "title": message.to.title.as_deref(),
++                    },
++                    "state": message.state.as_str(),
++                    "sentAtMs": message.sent_at_ms,
++                    "replyTo": message.reply_to.as_deref(),
++                    "pass": message.count,
++                    "reason": message.reason.as_deref(),
++                })
++            })
++            .collect::<Vec<_>>();
++        json!({"messages": rows, "count": rows.len(), "kept": "messages are kept for a week"})
++    }
++}
+diff --git a/src/crates/messaging/src/tests.rs b/src/crates/messaging/src/tests.rs
+index d70b400..d88309e 100644
+--- a/src/crates/messaging/src/tests.rs
++++ b/src/crates/messaging/src/tests.rs
+@@ -578,7 +578,7 @@ fn an_uncertain_antigravity_send_is_not_reported_as_refused() {
+ }
+ 
+ #[test]
+-fn the_group_lists_its_four_tools_only_while_it_is_on() {
++fn the_group_lists_its_five_tools_only_while_it_is_on() {
+     assert_eq!(Messaging::tools(false), json!({"tools":[]}));
+     let names = Messaging::tools(true)["tools"]
+         .as_array()
+@@ -592,7 +592,8 @@ fn the_group_lists_its_four_tools_only_while_it_is_on() {
+             "list_sessions",
+             "send_message",
+             "start_session",
+-            "get_message"
++            "get_message",
++            "list_sent_messages"
+         ]
+     );
+     for tool in Messaging::tools(true)["tools"].as_array().unwrap() {
+@@ -601,6 +602,55 @@ fn the_group_lists_its_four_tools_only_while_it_is_on() {
+     }
+ }
+ 
++#[test]
++fn the_outbox_lists_this_sessions_own_sends_newest_first() {
++    let mut world = World::on();
++    world.check_in(QUIET);
++    let first = world.send(("claude", CLAUDE), CODEX, "Review this");
++    let first_id = first["id"].as_str().unwrap().to_owned();
++    let second = world.send(("claude", CLAUDE), QUIET, "Second");
++    let second_id = second["id"].as_str().unwrap().to_owned();
++    // Another session's send stays out of this session's outbox.
++    let other = world.send(("codex", CODEX), CLAUDE, "Not mine");
++    assert_eq!(other["state"], "queued", "{other}");
++    let outbox = world.call(Some(("claude", CLAUDE)), "list_sent_messages", json!({}));
++    let ids = outbox["messages"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|message| message["id"].as_str().unwrap().to_owned())
++        .collect::<Vec<_>>();
++    assert_eq!(ids, [second_id.clone(), first_id.clone()], "{outbox}");
++    assert_eq!(outbox["count"], 2);
++    assert_eq!(outbox["messages"][0]["to"]["sessionId"], QUIET);
++    assert_eq!(outbox["messages"][0]["state"], "queued");
++    // The limit takes the newest only.
++    let one = world.call(
++        Some(("claude", CLAUDE)),
++        "list_sent_messages",
++        json!({"limit":1}),
++    );
++    assert_eq!(one["messages"].as_array().unwrap().len(), 1);
++    assert_eq!(one["messages"][0]["id"], second_id);
++    // `since` keeps what was sent at or after it.
++    let at = world.messaging.journal.find(&first_id).unwrap().sent_at_ms;
++    let after = world.call(
++        Some(("claude", CLAUDE)),
++        "list_sent_messages",
++        json!({"since": at + 1}),
++    );
++    assert_eq!(after["messages"].as_array().unwrap().len(), 0, "{after}");
++    let all = world.call(
++        Some(("claude", CLAUDE)),
++        "list_sent_messages",
++        json!({"since": at}),
++    );
++    assert_eq!(all["messages"].as_array().unwrap().len(), 2, "{all}");
++    // Without a caller it refuses rather than listing everyone's sends.
++    let anonymous = world.call(None, "list_sent_messages", json!({}));
++    assert_eq!(anonymous["state"], "refused");
++}
++
+ #[test]
+ fn while_the_switch_is_off_every_call_is_refused_saying_where_to_turn_it_on() {
+     let mut world = World::new(Preferences::default());
+@@ -608,9 +658,7 @@ fn while_the_switch_is_off_every_call_is_refused_saying_where_to_turn_it_on() {
+     assert_eq!(answer["state"], "refused");
+     assert!(answer["reason"].as_str().unwrap().contains("Agent plugins"));
+     assert!(world.codex.0.lock().unwrap().is_empty());
+-}
+-
+-#[test]
++}#[test]
+ fn an_unknown_caller_sends_nothing() {
+     let mut world = World::on();
+     let answer = world.call(None, "send_message", json!({"to":CODEX,"text":"Hi"}));
+diff --git a/src/crates/messaging/src/tools.rs b/src/crates/messaging/src/tools.rs
+index 6996c97..41e0446 100644
+--- a/src/crates/messaging/src/tools.rs
++++ b/src/crates/messaging/src/tools.rs
+@@ -1,4 +1,4 @@
+-//! The four tools agents see, as the MCP relay lists them.
++//! The five tools agents see, as the MCP relay lists them.
+ use super::*;
+ 
+ impl Messaging {
+@@ -19,7 +19,10 @@ impl Messaging {
+              "inputSchema":{"type":"object","properties":{"client":{"type":"string","enum":["claude","codex","antigravity","deepseek"]},"folder":{"type":"string","description":"A folder from startFolders, or empty for none. Defaults to your session's project."},"text":{"type":"string","description":"The first message, whole."},"reply_hint":{"type":"boolean","description":"Default true: the message ends with a line asking the recipient to answer with send_message. false: that line asks it to answer in its turn and send nothing back; read the answer with get_message."}},"required":["client","text"],"additionalProperties":false}},
+             {"name":"get_message","readOnly":true,
+              "description":"Read where a message you sent stands: queued, taken (the session took it and waits to go idle), started (its turn runs), done (with answer: the session's last reply in the turn your message started, whole), replied (the session answered with send_message: reply is that message's id, and its words come to your session as a new turn once you are idle), refused, expired or uncertain, with the reason. Reads only what Agent HUD already collected about the other session; it never asks or wakes it. Your own client may shorten a long result: Claude Code keeps about 50,000 characters in the conversation and saves a longer result to a file it names; Codex keeps about 10,000 tokens, the beginning and the end.",
+-             "inputSchema":{"type":"object","properties":{"id":{"type":"string","description":"The message id send_message or start_session returned."}},"required":["id"],"additionalProperties":false}}
++             "inputSchema":{"type":"object","properties":{"id":{"type":"string","description":"The message id send_message or start_session returned."}},"required":["id"],"additionalProperties":false}},
++            {"name":"list_sent_messages","readOnly":true,
++             "description":"List what this session sent through Agent HUD, newest first by the time each was sent: id, to (client, sessionId, title), state, sentAtMs, replyTo, pass and reason. Use it when send_message's answer did not come back (the relay timed out): the message may already be queued, and this shows its id and where it went, so it is not sent twice. Only the calling session's own messages are shown; they are kept for a week. A message whose call died before its record was written does not appear: an empty list is not proof it was not sent.",
++             "inputSchema":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":100,"description":"How many messages, newest first. 20 unless given."},"since":{"type":"integer","description":"Only messages sent at or after this Unix time in milliseconds."}},"additionalProperties":false}}
+         ]})
+     }
+ }

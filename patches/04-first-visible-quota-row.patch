@@ -1,0 +1,584 @@
+diff --git a/src/crates/hud/src/vendors.rs b/src/crates/hud/src/vendors.rs
+index 5c76236..aebc3cb 100644
+--- a/src/crates/hud/src/vendors.rs
++++ b/src/crates/hud/src/vendors.rs
+@@ -164,6 +164,49 @@ pub fn vendors<'a>(snapshot: &'a Value, mode: &str, now_ms: i64) -> Vec<Vendor<'
+         .collect()
+ }
+ 
++fn quota_row_matches(quota: &Value, key: &str) -> bool {
++    let id = quota["id"].as_str().unwrap_or("");
++    if id == key {
++        return true;
++    }
++    if let Some(legacy) = quota["legacyWindowId"].as_str() {
++        if legacy == key {
++            return true;
++        }
++        if let Some(account_id) = quota["accountId"].as_str() {
++            if let Some(suffix) = legacy.strip_prefix(account_id) {
++                if let Some(rest) = suffix.strip_prefix('/') {
++                    if rest == key {
++                        return true;
++                    }
++                }
++            }
++        }
++    }
++    false
++}
++
++fn quota_account_key(quota: &Value) -> &str {
++    quota["accountId"]
++        .as_str()
++        .or_else(|| quota["account"].as_str())
++        .unwrap_or("unassigned")
++}
++
++fn is_quota_active(q: &Value, now_ms: i64) -> bool {
++    if !q["usedPercent"].is_number() || q["status"].as_str() == Some("stale") {
++        return false;
++    }
++    if let Some(reset_str) = q["resetAt"].as_str() {
++        if let Ok(at) = chrono::DateTime::parse_from_rfc3339(reset_str) {
++            if at.timestamp_millis() <= now_ms {
++                return false;
++            }
++        }
++    }
++    true
++}
++
+ /// The marks a screen's HUD shows, in Settings' agent order, the layout's `order`
+ /// (resting-agents.ts `layoutMarks`). Its `hud.agents` picks which marks show but
+ /// not their order; a list naming none of the available agents never empties a
+@@ -186,6 +229,80 @@ pub fn configured<'a>(
+             vendor.balance = balance;
+             vendor.level = level;
+             vendor.usage = None;
++        } else if !vendor.quotas.is_empty() {
++            let blocks = &layout["blocks"];
++            let mut candidate_keys = vec![vendor.key.as_str()];
++            for q in &vendor.quotas {
++                if let Some(v) = q["vendor"].as_str() {
++                    if !candidate_keys.contains(&v) {
++                        candidate_keys.push(v);
++                    }
++                }
++            }
++            let block = candidate_keys.into_iter().find_map(|key| {
++                let b = &blocks[key];
++                if b.is_object()
++                    && b["hidden"].as_bool() != Some(true)
++                    && b["rows"].as_array().map_or(false, |r| !r.is_empty())
++                {
++                    Some(b)
++                } else {
++                    None
++                }
++            });
++
++            if let Some(block) = block {
++                let rows_order = block["rows"].as_array();
++                let hidden_rows = block["hiddenRows"].as_array();
++                let hidden_accounts = block["hiddenAccounts"].as_array();
++                let accounts = block["accounts"].as_array();
++
++                let mut matched: Vec<&Value> = vendor
++                    .quotas
++                    .iter()
++                    .copied()
++                    .filter(|q| {
++                        let row_hidden = hidden_rows.is_some_and(|hr| {
++                            hr.iter().any(|k| {
++                                k.as_str().map_or(false, |key| quota_row_matches(q, key))
++                            })
++                        });
++                        if row_hidden {
++                            return false;
++                        }
++                        let acct = quota_account_key(q);
++                        let acct_hidden = hidden_accounts.is_some_and(|ha| {
++                            ha.iter().any(|a| a.as_str() == Some(acct))
++                        });
++                        if acct_hidden {
++                            return false;
++                        }
++                        let acct_allowed = accounts.map_or(true, |accs| {
++                            accs.is_empty() || accs.iter().any(|a| a.as_str() == Some(acct))
++                        });
++                        acct_allowed
++                    })
++                    .collect();
++
++                matched.sort_by_key(|q| {
++                    rows_order
++                        .and_then(|arr| {
++                            arr.iter().position(|r| {
++                                r.as_str().map_or(false, |key| quota_row_matches(q, key))
++                            })
++                        })
++                        .unwrap_or(usize::MAX)
++                });
++
++                if let Some(first_active) = matched.iter().find(|q| is_quota_active(q, now_ms)) {
++                    if let Some(used) = first_active["usedPercent"].as_f64() {
++                        vendor.used = Some(used);
++                        if let Some(lvl) = first_active["status"].as_str() {
++                            vendor.level = lvl;
++                        }
++                    }
++                }
++            }
+         }
+     }
+     let marks: Vec<String> = layout["hud"]["agents"]
+diff --git a/src/crates/hud/src/vendors/tests.rs b/src/crates/hud/src/vendors/tests.rs
+index 4545ee1..67a77ec 100644
+--- a/src/crates/hud/src/vendors/tests.rs
++++ b/src/crates/hud/src/vendors/tests.rs
+@@ -320,3 +320,150 @@ fn domestic_agent_variants_stay_separate_marks_and_vendors() {
+         ]
+     );
+ }
++
++#[test]
++fn configured_vendors_honor_row_order_alias_mapping_and_stale_fallback() {
++    let now = chrono::DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
++        .unwrap()
++        .timestamp_millis();
++    let snapshot = json!({
++        "language": "en",
++        "quotas": [
++            {
++                "id": "codex:5h",
++                "legacyWindowId": "user1/5h",
++                "accountId": "user1",
++                "vendor": "codex",
++                "usedPercent": 35.0,
++                "status": "normal",
++                "resetAt": "2026-11-11T15:00:00Z"
++            },
++            {
++                "id": "codex:week",
++                "legacyWindowId": "user1/week",
++                "accountId": "user1",
++                "vendor": "codex",
++                "usedPercent": 85.0,
++                "status": "warning",
++                "resetAt": "2026-11-15T00:00:00Z"
++            }
++        ],
++        "billing": [],
++        "providers": [],
++        "approvals": [],
++        "sessions": []
++    });
++
++    // 1. Without custom layout: defaults to tightest (week = 85.0%, warning)
++    let default_list = configured(&snapshot, "simple", &json!({}), now);
++    let openai = default_list.iter().find(|v| v.key == "openai").unwrap();
++    assert_eq!(openai.used, Some(85.0));
++    assert_eq!(openai.level, "warning");
++
++    // 2. With row ordering in "codex" provider block: aliases properly and picks 5h (35.0%, normal)
++    let ordered_layout = json!({
++        "blocks": {
++            "codex": {
++                "rows": ["5h", "week"]
++            }
++        }
++    });
++    let list2 = configured(&snapshot, "simple", &ordered_layout, now);
++    let openai2 = list2.iter().find(|v| v.key == "openai").unwrap();
++    assert_eq!(openai2.used, Some(35.0));
++    assert_eq!(openai2.level, "normal");
++
++    // 3. If block is marked hidden: true, skips it and falls back to tightest (85.0%, warning)
++    let hidden_block_layout = json!({
++        "blocks": {
++            "codex": {
++                "hidden": true,
++                "rows": ["5h", "week"]
++            }
++        }
++    });
++    let list3 = configured(&snapshot, "simple", &hidden_block_layout, now);
++    let openai3 = list3.iter().find(|v| v.key == "openai").unwrap();
++    assert_eq!(openai3.used, Some(85.0));
++    assert_eq!(openai3.level, "warning");
++
++    // 4. Stale first row does NOT mask live tightest warning; skips stale to find next live row
++    let stale_first_snapshot = json!({
++        "language": "en",
++        "quotas": [
++            {
++                "id": "codex:5h",
++                "legacyWindowId": "user1/5h",
++                "accountId": "user1",
++                "vendor": "codex",
++                "usedPercent": 0.0,
++                "status": "stale",
++                "resetAt": "2026-11-11T15:00:00Z"
++            },
++            {
++                "id": "codex:week",
++                "legacyWindowId": "user1/week",
++                "accountId": "user1",
++                "vendor": "codex",
++                "usedPercent": 99.0,
++                "status": "critical",
++                "resetAt": "2026-11-15T00:00:00Z"
++            }
++        ],
++        "billing": [],
++        "providers": [],
++        "approvals": [],
++        "sessions": []
++    });
++    let list4 = configured(&stale_first_snapshot, "simple", &ordered_layout, now);
++    let openai4 = list4.iter().find(|v| v.key == "openai").unwrap();
++    assert_eq!(openai4.used, Some(99.0));
++    assert_eq!(openai4.level, "critical");
++
++    // 5. Expired resetAt is treated as not active, falls back to next valid row
++    let expired_first_snapshot = json!({
++        "language": "en",
++        "quotas": [
++            {
++                "id": "codex:5h",
++                "legacyWindowId": "user1/5h",
++                "accountId": "user1",
++                "vendor": "codex",
++                "usedPercent": 10.0,
++                "status": "normal",
++                "resetAt": "2026-11-11T11:00:00Z"
++            },
++            {
++                "id": "codex:week",
++                "legacyWindowId": "user1/week",
++                "accountId": "user1",
++                "vendor": "codex",
++                "usedPercent": 75.0,
++                "status": "warning",
++                "resetAt": "2026-11-15T00:00:00Z"
++            }
++        ],
++        "billing": [],
++        "providers": [],
++        "approvals": [],
++        "sessions": []
++    });
++    let list5 = configured(&expired_first_snapshot, "simple", &ordered_layout, now);
++    let openai5 = list5.iter().find(|v| v.key == "openai").unwrap();
++    assert_eq!(openai5.used, Some(75.0));
++    assert_eq!(openai5.level, "warning");
++
++    // 6. Account filtering and hiddenRows
++    let hidden_row_layout = json!({
++        "blocks": {
++            "codex": {
++                "rows": ["5h", "week"],
++                "hiddenRows": ["5h"]
++            }
++        }
++    });
++    let list6 = configured(&snapshot, "simple", &hidden_row_layout, now);
++    let openai6 = list6.iter().find(|v| v.key == "openai").unwrap();
++    assert_eq!(openai6.used, Some(85.0));
++    assert_eq!(openai6.level, "warning");
++}
+diff --git a/src/packages/hud/src/HUDScene.tsx b/src/packages/hud/src/HUDScene.tsx
+index 84320c9..b7e26d0 100644
+--- a/src/packages/hud/src/HUDScene.tsx
++++ b/src/packages/hud/src/HUDScene.tsx
+@@ -174,7 +174,7 @@ export function HUDScene({
+   const panelServices = usePanelServices();
+   const vendors = useMemo(
+     () => configuredVendors(snapshot, config),
+-    [snapshot, config.mode, config.panelLayout.order, config.panelLayout.hud],
++    [snapshot, config.mode, JSON.stringify(config.panelLayout)],
+   );
+   const { holdActive, endHold, enter, leave } = useEditHold({
+     hover,
+diff --git a/src/packages/hud/src/model.ts b/src/packages/hud/src/model.ts
+index e192ba1..d1763cd 100644
+--- a/src/packages/hud/src/model.ts
++++ b/src/packages/hud/src/model.ts
+@@ -1,13 +1,14 @@
+-import hudDefaults from "@agent-hud/protocol/hud-defaults.json";
++import hudDefaults from "@agent-hud/protocol/hud-defaults.json" with { type: "json" };
+ import type {
+   PanelLayout,
+   RequestDecision,
+   Snapshot,
+ } from "@agent-hud/protocol";
+-import { agentArtworkKey, agentVendorName } from "./agent-artwork";
++import { agentArtworkKey, agentVendorName } from "./agent-artwork.ts";
+ import { layoutMarks, restingAgents } from "./resting-agents.ts";
+ import { recentLabel, recentUsage } from "./recent-usage.ts";
+ import { visibleBalances } from "./balance-rows.ts";
++import { blockRows } from "./quota-rows.ts";
+ import { heldUsed } from "./held-reading.ts";
+ import type { GlowEffect, GlowStyle } from "./HUDGlow";
+ import type { UsageStyle } from "./usage-meter/arcs";
+@@ -17,7 +18,7 @@ import {
+   quotaPercentLabel,
+   type QuotaDisplay,
+ } from "@agent-hud/ui/format";
+-export { agentVendorName } from "./agent-artwork";
++export { agentVendorName } from "./agent-artwork.ts";
+ 
+ export type HUDMode = "notch" | "simple";
+ export type HUDEdge = "top" | "right" | "bottom" | "left";
+@@ -229,26 +230,61 @@ export function configuredVendors(
+   snapshot: Snapshot,
+   config: HUDConfig,
+ ): HUDVendor[] {
++  const now = Date.now();
+   const available = vendorsFromSnapshot(snapshot, config.mode).map((vendor) => {
+-    if (vendor.key !== "deepseek" || vendor.quotas.length) return vendor;
+-    const rows = snapshot.billing.filter(
+-      (row) => vendorKey(row.vendor) === vendor.key,
+-    );
+-    if (!rows.length) return vendor;
+-    const block = config.panelLayout.blocks?.[`api:${rows[0].vendor}`] ?? {};
+-    const visible = visibleBalances(rows, block);
+-    return {
+-      ...vendor,
+-      balance: visible.length
+-        ? visible
+-            .map((b) =>
+-              moneyAmount(b.amount, b.currency, snapshotLanguage(snapshot)),
+-            )
+-            .join(" · ")
+-        : null,
+-      level: balanceLevel(visible) ?? "stale",
+-      usage: null,
+-    };
++    if (vendor.key === "deepseek" && !vendor.quotas.length) {
++      const rows = snapshot.billing.filter(
++        (row) => vendorKey(row.vendor) === vendor.key,
++      );
++      if (!rows.length) return vendor;
++      const block = config.panelLayout.blocks?.[`api:${rows[0].vendor}`] ?? {};
++      const visible = visibleBalances(rows, block);
++      return {
++        ...vendor,
++        balance: visible.length
++          ? visible
++              .map((b) =>
++                moneyAmount(b.amount, b.currency, snapshotLanguage(snapshot)),
++              )
++              .join(" · ")
++          : null,
++        level: balanceLevel(visible) ?? "stale",
++        usage: null,
++      };
++    }
++    if (vendor.quotas.length) {
++      const blocks = config.panelLayout.blocks;
++      if (blocks) {
++        const candidateKeys = [
++          vendor.key,
++          ...new Set(vendor.quotas.map((q) => q.vendor)),
++        ];
++        const blockKey = candidateKeys.find((k) => {
++          const b = blocks[k];
++          return b && !b.hidden && b.rows?.length;
++        });
++        if (blockKey) {
++          const block = blocks[blockKey];
++          const visible = blockRows(vendor.quotas, block);
++          const activeRow = visible.find((r) => {
++            if (r.usedPercent == null || r.status === "stale") return false;
++            if (r.resetAt) {
++              const reset = Date.parse(r.resetAt);
++              if (Number.isFinite(reset) && reset <= now) return false;
++            }
++            return true;
++          });
++          if (activeRow && activeRow.usedPercent != null) {
++            return {
++              ...vendor,
++              used: activeRow.usedPercent,
++              level: activeRow.status ?? vendor.level,
++            };
++          }
++        }
++      }
++    }
++    return vendor;
+   });
+   return layoutMarks(available, config.panelLayout);
+ }
+diff --git a/src/packages/hud/test/configured-vendors.test.ts b/src/packages/hud/test/configured-vendors.test.ts
+new file mode 100644
+index 0000000..f412588
+--- /dev/null
++++ b/src/packages/hud/test/configured-vendors.test.ts
+@@ -0,0 +1,164 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { configuredVendors, type HUDConfig } from "../src/model.ts";
++import type { Snapshot } from "@agent-hud/protocol";
++
++const baseConfig: HUDConfig = {
++  mode: "simple",
++  animations: false,
++  sound: false,
++  theme: "system",
++  panelLayout: {},
++} as never;
++
++test("configuredVendors picks the first active configured row over tightest", () => {
++  const snapshot: Snapshot = {
++    language: "en",
++    quotas: [
++      {
++        id: "codex:5h",
++        legacyWindowId: "acct1/5h",
++        accountId: "acct1",
++        vendor: "codex",
++        name: "5h",
++        usedPercent: 35,
++        status: "normal",
++        resetAt: new Date(Date.now() + 3600_000).toISOString(),
++      },
++      {
++        id: "codex:week",
++        legacyWindowId: "acct1/week",
++        accountId: "acct1",
++        vendor: "codex",
++        name: "Week",
++        usedPercent: 85,
++        status: "warning",
++        resetAt: new Date(Date.now() + 86400_000).toISOString(),
++      },
++    ],
++    billing: [],
++    providers: [],
++    approvals: [],
++    sessions: [],
++    settings: { animations: false },
++  } as never;
++
++  // 1. Without layout: defaults to tightest (week = 85%)
++  const defaultVendors = configuredVendors(snapshot, baseConfig);
++  const openai = defaultVendors.find((v) => v.key === "openai");
++  assert.equal(openai?.used, 85);
++  assert.equal(openai?.level, "warning");
++
++  // 2. With row ordering in "codex" provider block: picks 5h (35%)
++  const configWithRows: HUDConfig = {
++    ...baseConfig,
++    panelLayout: {
++      blocks: {
++        codex: {
++          rows: ["5h", "week"],
++        },
++      },
++    },
++  };
++  const vendors2 = configuredVendors(snapshot, configWithRows);
++  const openai2 = vendors2.find((v) => v.key === "openai");
++  assert.equal(openai2?.used, 35);
++  assert.equal(openai2?.level, "normal");
++
++  // 3. Hidden block is skipped: falls back to tightest (85%)
++  const configWithHiddenBlock: HUDConfig = {
++    ...baseConfig,
++    panelLayout: {
++      blocks: {
++        codex: {
++          hidden: true,
++          rows: ["5h", "week"],
++        },
++      },
++    },
++  };
++  const vendors3 = configuredVendors(snapshot, configWithHiddenBlock);
++  const openai3 = vendors3.find((v) => v.key === "openai");
++  assert.equal(openai3?.used, 85);
++  assert.equal(openai3?.level, "warning");
++});
++
++test("configuredVendors does not let a stale or expired first row mask tightest alerts", () => {
++  const staleFirstSnapshot: Snapshot = {
++    language: "en",
++    quotas: [
++      {
++        id: "codex:5h",
++        legacyWindowId: "acct1/5h",
++        accountId: "acct1",
++        vendor: "codex",
++        name: "5h",
++        usedPercent: 0,
++        status: "stale",
++        resetAt: new Date(Date.now() + 3600_000).toISOString(),
++      },
++      {
++        id: "codex:week",
++        legacyWindowId: "acct1/week",
++        accountId: "acct1",
++        vendor: "codex",
++        name: "Week",
++        usedPercent: 99,
++        status: "critical",
++        resetAt: new Date(Date.now() + 86400_000).toISOString(),
++      },
++    ],
++    billing: [],
++    providers: [],
++    approvals: [],
++    sessions: [],
++    settings: { animations: false },
++  } as never;
++
++  const configWithRows: HUDConfig = {
++    ...baseConfig,
++    panelLayout: {
++      blocks: {
++        codex: {
++          rows: ["5h", "week"],
++        },
++      },
++    },
++  };
++
++  const vendors = configuredVendors(staleFirstSnapshot, configWithRows);
++  const openai = vendors.find((v) => v.key === "openai");
++  assert.equal(openai?.used, 99);
++  assert.equal(openai?.level, "critical");
++
++  // Expired resetAt row is also skipped
++  const expiredFirstSnapshot: Snapshot = {
++    ...staleFirstSnapshot,
++    quotas: [
++      {
++        id: "codex:5h",
++        legacyWindowId: "acct1/5h",
++        accountId: "acct1",
++        vendor: "codex",
++        name: "5h",
++        usedPercent: 10,
++        status: "normal",
++        resetAt: new Date(Date.now() - 3600_000).toISOString(), // 1h in past
++      },
++      {
++        id: "codex:week",
++        legacyWindowId: "acct1/week",
++        accountId: "acct1",
++        vendor: "codex",
++        name: "Week",
++        usedPercent: 70,
++        status: "warning",
++        resetAt: new Date(Date.now() + 86400_000).toISOString(),
++      },
++    ],
++  };
++  const vendorsExpired = configuredVendors(expiredFirstSnapshot, configWithRows);
++  const openaiExpired = vendorsExpired.find((v) => v.key === "openai");
++  assert.equal(openaiExpired?.used, 70);
++  assert.equal(openaiExpired?.level, "warning");
++});

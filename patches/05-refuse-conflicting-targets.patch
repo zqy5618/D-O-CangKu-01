@@ -1,0 +1,240 @@
+diff --git a/src/crates/messaging/src/send.rs b/src/crates/messaging/src/send.rs
+index 51a00dd..64d63bb 100644
+--- a/src/crates/messaging/src/send.rs
++++ b/src/crates/messaging/src/send.rs
+@@ -31,6 +31,25 @@ impl Messaging {
+         if named.is_none() && replied.is_none() {
+             return Err("to is required, unless reply_to names a message you received".into());
+         }
++        // A reply and a target that name different sessions: the caller has
++        // two answers to where this goes. Sending it to `to` and filing it as
++        // a reply to the other party's message was the wrong one, silently.
++        if let (Some(target), Some(parent)) = (named, replied.as_ref()) {
++            if let Some(found) = find(host.snapshot, target) {
++                let found_id = found["id"].as_str().unwrap_or(target);
++                let found_client = found["source"].as_str().unwrap_or_default();
++                if !same_identity(
++                    (found_client, found_id),
++                    (parent.from.client.as_str(), parent.from.session_id.as_str()),
++                ) {
++                    return Ok(refused(&words::conflicting_targets(
++                        language,
++                        found_id,
++                        &parent.from.session_id,
++                    )));
++                }
++            }
++        }
+         if let Some(reason) = check_text(text, language) {
+             return Ok(refused(&reason));
+         }
+@@ -57,7 +76,11 @@ impl Messaging {
+         if !target["parentId"].is_null() {
+             return Ok(refused(&words::child(language)));
+         }
+-        let sender = party(host.snapshot, &caller.client, &caller.session_id);
++        let sender = party(
++            host.snapshot,
++            &caller.client,
++            &caller_id(host.snapshot, &caller.client, &caller.session_id),
++        );
+         let recipient = party(host.snapshot, client, to);
+         // One that cannot take it now is refused before anything is queued.
+         if let (Value::Bool(false), reason) = self.reachable(
+diff --git a/src/crates/messaging/src/snapshot.rs b/src/crates/messaging/src/snapshot.rs
+index e76d5d4..215b30d 100644
+--- a/src/crates/messaging/src/snapshot.rs
++++ b/src/crates/messaging/src/snapshot.rs
+@@ -108,3 +108,12 @@ pub(crate) fn party(snapshot: &Value, client: &str, id: &str) -> Party {
+             .map(str::to_owned),
+     }
+ }
++/// The caller's id as the snapshot names its session (`antigravity:…`,
++/// `deepseek:…`, or the client's own id), so a message header shows the same
++/// id list_sessions and get_message do.
++pub(crate) fn caller_id(snapshot: &Value, client: &str, id: &str) -> String {
++    find_in(snapshot, client, id)
++        .and_then(|session| session["id"].as_str())
++        .unwrap_or(id)
++        .to_owned()
++}
+diff --git a/src/crates/messaging/src/start.rs b/src/crates/messaging/src/start.rs
+index 718057d..faea3fc 100644
+--- a/src/crates/messaging/src/start.rs
++++ b/src/crates/messaging/src/start.rs
+@@ -49,7 +49,11 @@ impl Messaging {
+             return Ok(refused(&words::folder(language, &folder, &offer.folders)));
+         }
+         let (chain, count) = self.next_pass(caller, host, None);
+-        let sender = party(host.snapshot, &caller.client, &caller.session_id);
++        let sender = party(
++            host.snapshot,
++            &caller.client,
++            &caller_id(host.snapshot, &caller.client, &caller.session_id),
++        );
+         let newcomer = Party {
+             client: client.into(),
+             session_id: String::new(),
+@@ -65,7 +69,11 @@ impl Messaging {
+         }
+         let id = message_id();
+         let form = self.form();
+-        let from = party(host.snapshot, &caller.client, &caller.session_id);
++        let from = party(
++            host.snapshot,
++            &caller.client,
++            &caller_id(host.snapshot, &caller.client, &caller.session_id),
++        );
+         let delivered = words::compose(language, form, &from, client, &id, None, reply_hint, text);
+         let request_id = uuid::Uuid::new_v4().to_string();
+         let receipt = self.starts.start_with(
+diff --git a/src/crates/messaging/src/tests.rs b/src/crates/messaging/src/tests.rs
+index 560eefd..d70b400 100644
+--- a/src/crates/messaging/src/tests.rs
++++ b/src/crates/messaging/src/tests.rs
+@@ -720,7 +720,7 @@ fn a_labelled_message_names_its_sender_and_says_how_to_reply_and_waits_in_the_qu
+     let first = sent.text.lines().next().unwrap();
+     assert_eq!(
+         first,
+-        format!("[Agent HUD · from Claude Code · Fix the login · {id}]")
++        format!("[Agent HUD · from Claude Code · Fix the login · {id} · sender {CLAUDE}]")
+     );
+     assert!(sent.text.contains(&text), "the text goes whole");
+     // Codex names agent-hud's tool with an underscore.
+@@ -735,7 +735,7 @@ fn chinese_labels_follow_the_app_language() {
+     let id = answer["id"].as_str().unwrap();
+     let sent = world.codex.0.lock().unwrap()[0].text.clone();
+     assert!(sent.starts_with(&format!(
+-        "[Agent HUD · 来自 Claude Code · Fix the login · {id}]"
++        "[Agent HUD · 来自 Claude Code · Fix the login · {id} · 发送方 {CLAUDE}]"
+     )));
+     assert!(sent.ends_with(&format!("请用 agent-hud 的 MCP 工具 mcp__agent_hud__send_message 回复，reply_to: {id}，回复会作为一条消息送到发件方。没有这个工具时就直接作答，发件方能取回你这一轮最后的回答。")), "{sent}");
+ }
+@@ -808,6 +808,35 @@ fn what_cannot_take_a_message_is_refused_with_the_reason() {
+     assert!(world.codex.0.lock().unwrap().is_empty());
+ }
+ 
++#[test]
++fn a_reply_whose_to_names_another_session_is_refused_with_both_sessions() {
++    let mut world = World::on();
++    // Claude asks Codex; the message it must answer comes from Claude.
++    let first = world.send(("claude", CLAUDE), CODEX, "Review this");
++    assert_eq!(first["state"], "queued", "{first}");
++    let first_id = first["id"].as_str().unwrap().to_owned();
++    // Codex answers that message but also names a third session as `to`.
++    let refused = world.call(
++        Some(("codex", CODEX)),
++        "send_message",
++        json!({"text":"Two nits","to":QUIET,"reply_to":first_id}),
++    );
++    assert_eq!(refused["state"], "refused", "{refused}");
++    let reason = refused["reason"].as_str().unwrap();
++    assert!(reason.contains(QUIET), "{reason}");
++    assert!(reason.contains(CLAUDE), "{reason}");
++    // Nothing went out for either reading of the call.
++    assert_eq!(world.codex.0.lock().unwrap().len(), 1);
++    assert!(!world.channel.join("prompts").join(QUIET).exists());
++    // Naming the sender is the reply it already means.
++    let answer = world.call(
++        Some(("codex", CODEX)),
++        "send_message",
++        json!({"text":"Two nits","to":CLAUDE,"reply_to":first_id}),
++    );
++    assert_eq!(answer["state"], "queued", "{answer}");
++}
++
+ #[test]
+ fn a_deepseek_harness_session_takes_a_message_through_its_plugin_and_its_answer_is_read() {
+     let mut world = World::on();
+@@ -833,7 +862,7 @@ fn a_deepseek_harness_session_takes_a_message_through_its_plugin_and_its_answer_
+         serde_json::from_slice(&std::fs::read(world.harness_prompt(&id)).unwrap()).unwrap();
+     let delivered = left["text"].as_str().unwrap().to_owned();
+     assert!(delivered.starts_with(&format!(
+-        "[Agent HUD · from Claude Code · Fix the login · {id}]"
++        "[Agent HUD · from Claude Code · Fix the login · {id} · sender {CLAUDE}]"
+     )));
+     assert!(delivered.ends_with(&format!("Reply with agent-hud's MCP tool mcp__agent-hud__send_message, reply_to: {id}: your reply reaches the sender as a message. Without that tool, answer here: the sender can read this turn's last reply.")), "{delivered}");
+     // Its compressed log's tail marks where it ended: the answer is after.
+@@ -900,7 +929,7 @@ fn a_deepseek_harness_session_sends_under_its_own_id_and_the_passes_count() {
+     .unwrap();
+     let delivered = left["text"].as_str().unwrap().to_owned();
+     assert!(delivered.starts_with(&format!(
+-        "[Agent HUD · from DeepSeek Harness · Port the parser · {first_id}]"
++        "[Agent HUD · from DeepSeek Harness · Port the parser · {first_id} · sender {HARNESS}]"
+     )));
+     // Claude's turn began with it; its reply goes back to the Harness session.
+     world.transcripts.prompt(QUIET, "q1", &delivered);
+@@ -1098,7 +1127,7 @@ fn passes_count_while_messages_wake_each_other_and_stop_at_the_limit() {
+     )
+     .unwrap();
+     assert!(left["text"].as_str().unwrap().starts_with(&format!(
+-        "[Agent HUD · from Codex · Review · {second_id} · re {first_id}]"
++        "[Agent HUD · from Codex · Review · {second_id} · sender {CODEX} · re {first_id}]"
+     )));
+     // Claude's next turn began with Codex's reply: pass 3.
+     world
+@@ -1732,10 +1761,11 @@ fn a_reply_settles_the_message_it_answers_and_is_the_one_plane_back() {
+     assert_eq!(original["reply"], reply_id);
+ }
+ 
+-/// reply_to with another recipient is no reply to the sender: the message
+-/// it names stays open.
++/// reply_to with another recipient is no reply to the sender: the caller has
++/// named two destinations, so the call is refused and the message it names
++/// stays open.
+ #[test]
+-fn a_reply_sent_elsewhere_leaves_the_message_open() {
++fn a_reply_sent_elsewhere_is_refused_and_leaves_the_message_open() {
+     let mut world = World::on();
+     world.check_in(QUIET);
+     let first = world.send(("claude", CLAUDE), QUIET, "Ask Codex");
+@@ -1747,7 +1777,11 @@ fn a_reply_sent_elsewhere_leaves_the_message_open() {
+         "send_message",
+         json!({"to":CODEX,"text":"Claude asks","reply_to":id}),
+     );
+-    assert_eq!(onward["state"], "queued", "{onward}");
++    assert_eq!(onward["state"], "refused", "{onward}");
++    let reason = onward["reason"].as_str().unwrap();
++    assert!(reason.contains(CODEX), "{reason}");
++    assert!(reason.contains(CLAUDE), "{reason}");
++    assert!(world.codex.0.lock().unwrap().is_empty());
+     let original = world.get(&json!(id));
+     assert_ne!(original["state"], "replied", "{original}");
+     assert!(original["reply"].is_null());
+diff --git a/src/crates/messaging/src/words.rs b/src/crates/messaging/src/words.rs
+index c439f68..a769203 100644
+--- a/src/crates/messaging/src/words.rs
++++ b/src/crates/messaging/src/words.rs
+@@ -117,6 +117,16 @@ pub fn compose(
+             ("title", &title),
+         ],
+     );
++    let label = if from.session_id.is_empty() {
++        label
++    } else {
++        let tag = if language.is_chinese() { "发送方" } else { "sender" };
++        label.replacen(
++            &format!(" · {id}"),
++            &format!(" · {id} · {tag} {}", from.session_id),
++            1,
++        )
++    };
+     let footer = fill(
+         &footer,
+         &[("tool", &tool), ("id", &id), ("parent", &parent)],
+@@ -169,6 +179,15 @@ pub fn unknown_reply(language: Language, id: &str) -> String {
+         &[("id", &id)],
+     )
+ }
++/// `to` and `reply_to` name different sessions: say both, and how to mean
++/// one of them.
++pub fn conflicting_targets(language: Language, to: &str, sender: &str) -> String {
++    if language.is_chinese() {
++        format!("to {to} 与 reply_to 那条来件的发件方 {sender} 不是同一个会话。要回给来件方，就省略 to；要发给 {to}，就另发一条、不带 reply_to。")
++    } else {
++        format!("to {to} and the sender of the reply_to message, {sender}, are different sessions. Leave to out to answer the sender, or send a separate message to {to} without reply_to.")
++    }
++}
+ pub fn limit(language: Language, limit: u32) -> String {
+     fill(
+         &tr_in(language, "These agents have passed messages {{limit}} times in a row; waiting for the user to take a look. A word the user types in any session of the chain starts the count again."),

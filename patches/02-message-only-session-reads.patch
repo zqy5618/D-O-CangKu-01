@@ -1,0 +1,271 @@
+diff --git a/src/crates/core/src/sessions/detail.rs b/src/crates/core/src/sessions/detail.rs
+index bdabbea..34ec93b 100644
+--- a/src/crates/core/src/sessions/detail.rs
++++ b/src/crates/core/src/sessions/detail.rs
+@@ -55,6 +55,21 @@ impl AgentHudCore {
+                 json!({"session":session,"usage":Usage::default().json(),"turns":[],"calls":[],"parent":null,"children":[]}),
+             );
+         };
++        // Message tracking needs only the committed session identity and log page.
++        // Do not load token totals, account billing or tool-call history for every page.
++        if params["messagesOnly"] == true {
++            let path = selected.origin_path.as_ref().unwrap_or(&selected.path).clone();
++            let source = selected.source.clone();
++            let session = self.presentation(now).session(selected, None);
++            let cursor = params.get("messageCursor").map(|v| v.as_u64()
++                .ok_or("messageCursor must be a nonnegative byte offset")).transpose()?.unwrap_or(0);
++            let limit = params.get("messageLimit").map(|v| v.as_u64().filter(|n| *n > 0)
++                .ok_or("messageLimit must be positive")).transpose()?.unwrap_or(100).min(200) as usize;
++            let mut page = conversation::page(&path, &source, id, cursor, limit,
++                params["messageTail"] == true, &mut self.conversations, &mut self.conversation_context)?;
++            page["session"] = session;
++            return Ok(page);
++        }
+         let child_activity = Self::active_subagents(&logs, now);
+         let source = selected.source.clone();
+         let path = selected.path.clone();
+diff --git a/src/crates/host/src/backend.rs b/src/crates/host/src/backend.rs
+index 57ce21d..14abe49 100644
+--- a/src/crates/host/src/backend.rs
++++ b/src/crates/host/src/backend.rs
+@@ -38,6 +38,9 @@ impl Backend {
+         // Every pass retains its current generatedAt. Move, do not deep-clone,
+         // the new projection into the one application cache, even on quiet passes.
+         self.snapshot = Some(Arc::new(value));
++        if let (Some(messages), Some(snapshot)) = (&self.messages, &self.snapshot) {
++            messages.observe_snapshot(Arc::clone(snapshot));
++        }
+         if changed || recovered {
+             self.publish_snapshot(app);
+             if let (Some(extension), Some(snapshot)) = (&self.extension, &self.snapshot) {
+@@ -73,6 +76,7 @@ impl Backend {
+ 
+     pub(crate) fn publish_snapshot(&self, app: &tauri::AppHandle) {
+         if let Some(snapshot) = &self.snapshot {
++            if let Some(messages) = &self.messages { messages.observe_snapshot(Arc::clone(snapshot)); }
+             activity::publish(app, "hud:snapshot", snapshot.as_ref());
+             coordinator::snapshot(app, snapshot, true);
+         }
+diff --git a/src/crates/host/src/messages.rs b/src/crates/host/src/messages.rs
+index 0094a0e..8ecee83 100644
+--- a/src/crates/host/src/messages.rs
++++ b/src/crates/host/src/messages.rs
+@@ -22,6 +22,9 @@ use std::{
+ };
+ use tauri::Manager;
+ 
++mod cache;
++use cache::{SnapshotCache, lock_for_query};
++
+ const LOOK: Duration = Duration::from_secs(5);
+ 
+ /// The host's own senders: their receipts, and the Claude jobs it follows.
+@@ -33,6 +36,7 @@ struct Own {
+ 
+ pub(crate) struct AgentMessages {
+     messaging: Mutex<Messaging>,
++    latest: SnapshotCache,
+     conversations: Option<Arc<dyn Turns>>,
+     own: Option<Arc<Own>>,
+     backend: Weak<Mutex<Backend>>,
+@@ -71,6 +75,7 @@ impl AgentMessages {
+         );
+         let owner = Arc::new(Self {
+             messaging: Mutex::new(messaging),
++            latest: SnapshotCache::default(),
+             conversations: delivery.conversations,
+             own,
+             backend,
+@@ -101,16 +106,24 @@ impl AgentMessages {
+     /// One tool call from the relay: `{name, arguments, caller}`.
+     pub(crate) fn call(&self, params: &Value) -> Result<Value, String> {
+         let snapshot = self.snapshot()?;
+-        let query = self.query();
++        let base_query = self.query();
++        let query_error = std::cell::RefCell::new(None);
++        let query = |method: &str, args: Value| {
++            let result = base_query(method, args);
++            if let Err(error) = &result { *query_error.borrow_mut() = Some(error.clone()); }
++            result
++        };
+         let host = Host {
+             snapshot: &snapshot,
+             query: &query,
+             conversations: self.conversations.as_deref(),
+         };
+-        self.messaging
+-            .lock()
+-            .unwrap_or_else(PoisonError::into_inner)
+-            .call(params, &host, chrono::Utc::now().timestamp_millis())
++        let mut result = lock_for_query(&self.messaging)?
++            .call(params, &host, chrono::Utc::now().timestamp_millis())?;
++        if let Some(error) = query_error.borrow().as_ref() {
++            result["readNotice"] = Value::String(error.clone());
++        }
++        Ok(result)
+     }
+ 
+     /// The 5-second look: the host's own senders' receipts and moves, and
+@@ -145,25 +158,26 @@ impl AgentMessages {
+         messaging.maintain(&host, chrono::Utc::now().timestamp_millis());
+     }
+ 
+-    fn snapshot(&self) -> Result<Arc<Value>, String> {
+-        let backend = self
+-            .backend
+-            .upgrade()
+-            .ok_or("The application is stopping")?;
+-        let backend = backend.lock().unwrap_or_else(PoisonError::into_inner);
+-        backend
+-            .snapshot
+-            .clone()
+-            .ok_or_else(|| "Application data is loading".into())
++    pub(crate) fn observe_snapshot(&self, snapshot: Arc<Value>) {
++        self.latest.store(snapshot);
++    }
++
++    pub(crate) fn snapshot(&self) -> Result<Arc<Value>, String> {
++        self.latest.read()
+     }
+ 
+     /// The app's queries (`session_detail` pages), each under the
+     /// application's lock only while it runs.
+     fn query(&self) -> impl Fn(&str, Value) -> Result<Value, String> {
+         let backend = self.backend.clone();
+-        move |method, params| {
++        let deadline = std::time::Instant::now() + Duration::from_secs(90);
++        move |method, mut params| {
++            if std::time::Instant::now() >= deadline {
++                return Err("Transcript read budget exhausted; delivery state is unchanged".into());
++            }
+             let backend = backend.upgrade().ok_or("The application is stopping")?;
+-            let mut backend = backend.lock().unwrap_or_else(PoisonError::into_inner);
++            let mut backend = lock_for_query(&backend)?;
++            if method == "session_detail" { params["messagesOnly"] = Value::Bool(true); }
+             backend.runtime.local_query(method, params)
+         }
+     }
+diff --git a/src/crates/host/src/messages/cache.rs b/src/crates/host/src/messages/cache.rs
+new file mode 100644
+index 0000000..4b230c5
+--- /dev/null
++++ b/src/crates/host/src/messages/cache.rs
+@@ -0,0 +1,61 @@
++//! The committed message view must remain readable while ingestion owns Backend.
++use serde_json::Value;
++use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
++use std::time::{Duration, Instant};
++
++#[derive(Default)]
++pub(super) struct SnapshotCache(RwLock<Option<Arc<Value>>>);
++impl SnapshotCache {
++    pub(super) fn store(&self, snapshot: Arc<Value>) {
++        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Some(snapshot);
++    }
++    pub(super) fn read(&self) -> Result<Arc<Value>, String> {
++        self.0.read().unwrap_or_else(PoisonError::into_inner).clone()
++            .ok_or_else(|| "Application data is loading".into())
++    }
++}
++pub(super) fn lock_for_query<T>(owner: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
++    lock_with_budget(owner, Duration::from_secs(25))
++}
++fn lock_with_budget<T>(owner: &Mutex<T>, budget: Duration) -> Result<MutexGuard<'_, T>, String> {
++    let until = Instant::now() + budget;
++    loop {
++        match owner.try_lock() {
++            Ok(guard) => return Ok(guard),
++            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
++            Err(TryLockError::WouldBlock) => {
++                if Instant::now() >= until {
++                    return Err("Application data is busy; transcript was not read; delivery state is unchanged".into());
++                }
++                std::thread::sleep(Duration::from_millis(10));
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++    #[test]
++    fn message_snapshot_remains_readable_while_backend_is_busy() {
++        let backend = Mutex::new(());
++        let cache = SnapshotCache::default();
++        let snapshot = Arc::new(json!({"sessions":[{"id":"a","state":"running"}]}));
++        cache.store(Arc::clone(&snapshot));
++        let _busy = backend.lock().unwrap();
++        assert!(Arc::ptr_eq(&cache.read().unwrap(), &snapshot));
++        assert!(lock_with_budget(&backend, Duration::from_millis(20)).unwrap_err().contains("transcript was not read"));
++        assert_eq!(cache.read().unwrap()["sessions"][0]["state"], "running");
++    }
++    #[test]
++    fn loading_is_explicit_and_committed_snapshot_is_replaced_atomically() {
++        let cache = SnapshotCache::default();
++        assert!(cache.read().unwrap_err().contains("loading"));
++        cache.store(Arc::new(json!({"version":1})));
++        let before = cache.read().unwrap();
++        cache.store(Arc::new(json!({"version":2})));
++        assert_eq!(before["version"],1);
++        assert_eq!(cache.read().unwrap()["version"],2);
++    }
++}
+diff --git a/src/crates/host/src/service.rs b/src/crates/host/src/service.rs
+index bdb8512..10964e4 100644
+--- a/src/crates/host/src/service.rs
++++ b/src/crates/host/src/service.rs
+@@ -118,6 +118,7 @@ impl Service {
+             extension.as_ref().and_then(|product| product.delivery()),
+             tools_directory,
+         )?;
++        app.manage(Arc::clone(&messages));
+         backend
+             .lock()
+             .unwrap_or_else(PoisonError::into_inner)
+diff --git a/src/crates/host/src/tools.rs b/src/crates/host/src/tools.rs
+index 3db9f7b..e25d8ab 100644
+--- a/src/crates/host/src/tools.rs
++++ b/src/crates/host/src/tools.rs
+@@ -99,27 +99,31 @@ fn handle(
+     if HOST_METHODS.contains(&method) {
+         // Agent messages: never with the application's lock held, which
+         // their queries take.
+-        let (messages, snapshot) = {
+-            let owner = backend.lock().unwrap_or_else(PoisonError::into_inner);
+-            (owner.messages.clone(), owner.snapshot.clone())
+-        };
++        let messages = app.try_state::<Arc<AgentMessages>>()
++            .ok_or("Application data is loading")?;
++        let snapshot = messages.snapshot()?;
+         if !active.load(Ordering::Acquire) {
+             return Err("Local tools are disabled".into());
+         }
+         if method == "host_tools" {
+-            return Ok(AgentMessages::tools(
+-                snapshot.as_deref().unwrap_or(&Value::Null),
+-            ));
++            return Ok(AgentMessages::tools(snapshot.as_ref()));
+         }
+         let plugin = app.state::<super::deepseek_plugin::DeepSeekPlugin>();
+         let data = agent_hud_runtime::local_tools_directory().ok();
+         let params = with_caller(
+             (plugin.channel(), data.as_deref()),
+-            snapshot.as_deref(),
++            Some(snapshot.as_ref()),
+             params,
+             std::time::SystemTime::now(),
+         );
+-        return messages.ok_or("Application data is loading")?.call(&params);
++        return messages.call(&params);
++    }
++    if matches!(method, "snapshot" | "refresh") {
++        let messages = app.try_state::<Arc<AgentMessages>>()
++            .ok_or("Application data is loading")?;
++        let snapshot = messages.snapshot()?;
++        if snapshot["settings"]["hudTools"] != true { return Err("Local tools are disabled".into()); }
++        return Ok(snapshot.as_ref().clone());
+     }
+     let mut owner = backend.lock().unwrap_or_else(PoisonError::into_inner);
+     if !active.load(Ordering::Acquire) {
