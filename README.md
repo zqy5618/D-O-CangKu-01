@@ -29,10 +29,19 @@ and delivered, and one window retried, answering the same parent twice.
 Codex is not involved: no message on either chain has Codex as sender or
 recipient; it was only open concurrently.
 
-## Files
+## Comments posted
+
+| Posted | Link | File |
+|---|---|---|
+| 2026-11-17 | [#79 comment](https://github.com/jazzenchen/agent-hud-open/issues/79#issuecomment-6942635254) | `issue79-comment-20261117.md` |
+| 2026-11-17 | [#80 comment](https://github.com/jazzenchen/agent-hud-open/issues/80#issuecomment-6942774829) | `issue80-comment-20261117.md` |
+| 2026-11-17 | [#80 follow-up](https://github.com/jazzenchen/agent-hud-open/issues/80#issuecomment-6943382714) | `issue80-followup-20261117.md` |
+| 2026-11-17 | [#92 comment](https://github.com/jazzenchen/agent-hud-open/issues/92#issuecomment-6943378215) | `issue92-comment-20261117.md` |
+| 2026-11-17 | [#93 comment](https://github.com/jazzenchen/agent-hud-open/issues/93#issuecomment-6943378970) | `issue93-comment-20261117.md` |
+
+## Other files
 
 - `repro-record.md` — the evidence table (ids, clients, times, states).
-- `issue79-comment-20261117.md` — the comment posted on #79 on 2026-11-17.
 
 Everything here is desensitized: no case numbers, window titles, or session
 UUIDs. The unsanitized working copies stay on the local machine.
