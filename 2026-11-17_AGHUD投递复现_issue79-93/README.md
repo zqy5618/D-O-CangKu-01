@@ -1,4 +1,4 @@
-# 2026-11-17 AG-HUD delivery repro
+# 2026-11-17 AG-HUD delivery repro (issues #79–#93)
 
 Field records for the Agent HUD delivery problem discussed in
 [jazzenchen/agent-hud-open#79](https://github.com/jazzenchen/agent-hud-open/issues/79)
