@@ -38,6 +38,8 @@ recipient; it was only open concurrently.
 | 2026-11-17 | [#80 follow-up](https://github.com/jazzenchen/agent-hud-open/issues/80#issuecomment-6943382714) | `issue80-followup-20261117.md` |
 | 2026-11-17 | [#92 comment](https://github.com/jazzenchen/agent-hud-open/issues/92#issuecomment-6943378215) | `issue92-comment-20261117.md` |
 | 2026-11-17 | [#93 comment](https://github.com/jazzenchen/agent-hud-open/issues/93#issuecomment-6943378970) | `issue93-comment-20261117.md` |
+| 2026-11-17 | [#92 patch link](https://github.com/jazzenchen/agent-hud-open/issues/92#issuecomment-6943532800) | — |
+| 2026-11-17 | [#91 patch link](https://github.com/jazzenchen/agent-hud-open/issues/91#issuecomment-6943533683) | — |
 
 ## Patches
 
